@@ -14,15 +14,15 @@ from internlm.initialize.initialize_tensor import normal_, scaled_init_method_no
 from internlm.model.modules.embedding import Embedding1D
 from internlm.model.modules.mlp import get_mlp_cls
 from internlm.model.modules.multi_head_attention import MHA
+from internlm.model.ops.fusion_ops_import_helper import try_import_RMSNorm
 from internlm.model.ops.linear import RewardModelLinear, ScaleColumnParallelLinear
 from internlm.model.utils import (
     gather_forward_split_backward,
     split_forward_gather_backward,
-    try_import_RMSNorm,
 )
 from internlm.solver.activation_checkpoint import activation_checkpoint
 from internlm.solver.pipeline_utils import partition_uniform
-from internlm.utils.common import filter_kwargs
+from internlm.utils.common import filter_kwargs, get_current_device
 from internlm.utils.logger import get_logger
 from internlm.utils.registry import MODEL_INITIALIZER
 
@@ -75,6 +75,8 @@ class PackedFlashBaseLayer1D(nn.Module):
         use_flash_attn: bool = True,
         tp_mode: str = "mtp",
         rope_base: int = 10000,
+        mlp_layer_fusion: bool = False,
+        multiple_of: int = 256,
     ):
         super().__init__()
         self.checkpoint = checkpoint
@@ -125,23 +127,9 @@ class PackedFlashBaseLayer1D(nn.Module):
                 bias=False,
                 device=device,
                 dtype=dtype,
-            )
-        else:
-            from flash_attn.modules.mlp import ParallelFusedMLP
-
-            self.mlp = ParallelFusedMLP(
-                hidden_size,
-                int(hidden_size * mlp_ratio),
-                out_features=hidden_size,
-                activation="gelu_approx",
-                process_group=gpc.get_group(parallel_mode),
-                bias1=False,
-                bias2=False,
+                mlp_layer_fusion=mlp_layer_fusion,
                 sequence_parallel=gpc.config.parallel.sequence_parallel,
-                checkpoint_lvl=0,
-                heuristic="auto",
-                device=device,
-                dtype=dtype,
+                multiple_of=multiple_of,
             )
 
         self.dropout2 = nn.Dropout(drop_rate)
@@ -170,6 +158,7 @@ class PackedFlashBaseLayer1D(nn.Module):
                     if self.use_scaled_init and "w2" in name:
                         scaled_init_method_normal(sigma=0.006, num_layers=self.layer_idx + 1)(param.data)
                     else:
+                        # candidate: w1, w3, fused_w1_w3
                         normal_(std=0.006 if "w1" in name or "w3" in name else 0.0015)(param.data)
                 else:
                     if self.use_scaled_init and "fc1" not in name:
@@ -296,6 +285,8 @@ class PackedFlashInternLm1D(nn.Module):
         use_swiglu: bool = True,
         use_flash_attn: bool = True,
         rope_base: int = 10000,
+        mlp_layer_fusion: bool = False,
+        multiple_of: int = 256,
     ):
         super().__init__()
 
@@ -309,21 +300,9 @@ class PackedFlashInternLm1D(nn.Module):
         else:
             head_cls = ScaleColumnParallelLinear
         if first:
-            if embed_split_hidden or not use_flash_attn:
-                self.embedding = Embedding1D(num_embeddings=vocab_size, embedding_dim=hidden_size)
-            else:
-                from flash_attn.modules.embedding import ParallelGPT2Embeddings
-
-                self.embedding = ParallelGPT2Embeddings(
-                    embed_dim=hidden_size,
-                    vocab_size=vocab_size,
-                    max_position_embeddings=-1,
-                    process_group=gpc.get_group(ParallelMode.TENSOR),
-                    padding_idx=None,
-                    sequence_parallel=gpc.config.parallel.sequence_parallel,
-                    device=device,
-                    dtype=dtype,
-                )
+            self.embedding = Embedding1D(
+                num_embeddings=vocab_size, embedding_dim=hidden_size, embed_split_hidden=embed_split_hidden
+            )
             for _, param in self.embedding.named_parameters():
                 normal_(std=0.0052)(param)
         self.embed_grad_scale = embed_grad_scale
@@ -351,6 +330,8 @@ class PackedFlashInternLm1D(nn.Module):
                     use_flash_attn=use_flash_attn,
                     tp_mode=self.tp_mode,
                     rope_base=rope_base,
+                    mlp_layer_fusion=mlp_layer_fusion,
+                    multiple_of=multiple_of,
                 )
                 for lid in range(num_layers)
             ]
@@ -383,14 +364,13 @@ class PackedFlashInternLm1D(nn.Module):
                 hidden_states = (
                     self.embed_grad_scale * hidden_states + (1 - self.embed_grad_scale) * hidden_states.detach()
                 )
+
         if isinstance(cu_seqlens, list):
             assert len(cu_seqlens) == 1
             cu_seqlens = cu_seqlens[0].to(hidden_states.device)
 
         if cu_seqlens is not None:
             cu_seqlens = cu_seqlens.squeeze(0)
-            hidden_states = hidden_states.squeeze(0)  # If cu_seqlens is passed in，it indicated a packed state，
-            # the batch dimension with a size of 1 should be directly squeezed off.
 
         if indexes is not None:
             assert len(indexes) == 1
@@ -414,27 +394,24 @@ class PackedFlashInternLm1D(nn.Module):
         if hasattr(self, "norm"):
             hidden_states = self.norm(hidden_states.float())
         if hasattr(self, "head"):
-            # Evaluation
-            if hidden_states.ndim == 3:
-                hidden_states = self.head(hidden_states, gather_dim=1, tp_mode=self.tp_mode)
-            else:  # Training
-                hidden_states = self.head(hidden_states, gather_dim=0, tp_mode=self.tp_mode)
+            hidden_states = self.head(hidden_states, gather_dim=1, tp_mode=self.tp_mode)
 
         if not self.parallel_output and gpc.is_pipeline_last_stage():
             hidden_states = gather_forward_split_backward(hidden_states, ParallelMode.TENSOR, dim=-1)
         return hidden_states
 
 
-def _build_generic_model_1d(num_layers, num_chunks, device=torch.device("cuda"), **kwargs):
+def _build_generic_model_1d(num_layers, num_chunks, **kwargs):
     """
     build generic model 1d
 
     Args:
         num_layers (int): The number of layer.
         num_chunks (int): The number of partitions in pipeline parallel.
-        device (Optional[Union[str, torch.device]]): The device will be used. torch.device("cuda") by default.
+        device (Optional[Union[str, torch.device]]): The device will be used. internlm_accelerator.device() by default.
 
     """
+    device = get_current_device()
     pipeline_size = gpc.get_world_size(ParallelMode.PIPELINE)
     pipeline_rank = gpc.get_local_rank(ParallelMode.PIPELINE)
 
@@ -491,6 +468,8 @@ def build_model_with_cfg(
     use_swiglu: bool = True,
     use_flash_attn: bool = True,
     rope_base: int = 10000,
+    mlp_layer_fusion: bool = False,
+    multiple_of: int = 256,
 ):
     """
     Build model with config.
@@ -548,6 +527,8 @@ def build_model_with_cfg(
         use_swiglu=use_swiglu,
         use_flash_attn=use_flash_attn,
         rope_base=rope_base,
+        mlp_layer_fusion=mlp_layer_fusion,
+        multiple_of=multiple_of,
     )
 
     return _build_generic_model_1d(num_layers=num_layers, num_chunks=num_chunks, **cfg)

@@ -9,6 +9,7 @@ from typing import Dict, Union
 
 import torch
 
+from internlm.accelerator import AcceleratorType, get_accelerator
 from internlm.core.context import Config
 from internlm.core.context import global_context as gpc
 from internlm.core.context.process_group_initializer import ParallelMode
@@ -16,7 +17,6 @@ from internlm.model.moe.megablock.utils import (
     check_megablock_installed,
     check_stk_installed,
 )
-from internlm.monitor import initialize_light_monitor
 from internlm.utils.common import get_master_node
 from internlm.utils.gputest import warmup_process_group
 from internlm.utils.logger import get_logger
@@ -33,6 +33,7 @@ else:
     get_numa = True
 
 logger = get_logger(__file__)
+internlm_accelerator = get_accelerator()
 
 
 def get_default_parser():
@@ -163,6 +164,12 @@ def args_sanity_check():
         data._add_item("diag_outlier_ratio", 1.1)
 
     data.diag_outlier_ratio = max(1, data.diag_outlier_ratio)
+
+    if "use_packed_dataset" not in data:
+        data._add_item("use_packed_dataset", True)
+
+    if "fixed_random_dataset_seqlen" not in data:
+        data._add_item("fixed_random_dataset_seqlen", True)
 
     if gpc.is_rank_for_log():
         logger.info("+" * 15 + " Data Info " + "+" * 15)  # pylint: disable=W1201
@@ -314,6 +321,17 @@ def args_sanity_check():
     if "use_flash_attn" not in gpc.config.model:
         gpc.config.model._add_item("use_flash_attn", True)
 
+    old_parallel_output = gpc.config.model.get("parallel_output", None)
+    # Try to change user setting
+    if internlm_accelerator.get_accelerator_backend() is not AcceleratorType.GPU:
+        gpc.config.model.update({"parallel_output": False})
+        if old_parallel_output is True and gpc.is_rank_for_log():
+            logger.warning(
+                "'parallel_output' is converted from 'True' to 'False'."
+                "Because 'parallel_output' only support by FlashCrossEntropyLoss."
+                "Please make sure you are using flash attention in cuda device."
+            )
+
     if "MoE" in gpc.config.get("model_type", "INTERNLM"):
         if "num_experts" not in model:
             model._add_item("num_experts", 1)
@@ -328,13 +346,12 @@ def args_sanity_check():
             check_megablock_installed()
             check_stk_installed()
 
+    if "mlp_layer_fusion" not in model:
+        model._add_item("mlp_layer_fusion", False)
+
     # process the parallel config
     if "sequence_parallel" not in gpc.config.parallel:
         gpc.config.parallel._add_item("sequence_parallel", False)
-    else:
-        assert not (
-            gpc.config.parallel.sequence_parallel is True and gpc.config.model.use_flash_attn is False
-        ), "sequence parallel does not support use_flash_attn=False"
 
     # set default value for tensor parallel
     if isinstance(gpc.config.parallel["tensor"], int):
@@ -352,6 +369,21 @@ def args_sanity_check():
         "fsp",
         "isp",
     ], "invalid tensor parallel mode, only ['mtp', 'msp', 'fsp', 'isp'] is supported"
+
+    # for NPU accelerator supports: 1）FA-True + Packed-True 2) FA-False + Packed-False
+    # for DIPU accelerator supports: 1）FA-True + Packed-False 2) FA-False + Packed-False
+    # for GPU accelerator supports: 1）FA-True + Packed-True 2) FA-False + Packed-False
+    if gpc.config.parallel["tensor"]["mode"] == "isp" and internlm_accelerator.get_accelerator_backend() in [
+        AcceleratorType.NPU,
+        AcceleratorType.DIPU,
+    ]:
+        assert (
+            gpc.config.data.use_packed_dataset is False
+        ), "only unpacked data is supported when tensor parallel mode is isp and accelerator type is NPU or DIPU"
+    else:
+        assert (
+            gpc.config.model.use_flash_attn == gpc.config.data.use_packed_dataset
+        ), "use_packed_dataset should be set same value as use_flash_attn"
 
     # adapt to old version's sequence parallel config
     if gpc.config.parallel["tensor"].get("mode", None) in ["msp", "fsp", "isp"]:
@@ -473,12 +505,9 @@ def launch(
     gpc.init_parallel_groups()
 
     # set cuda device
-    if torch.cuda.is_available():
+    if internlm_accelerator.is_available():
         # if local rank is not given, calculate automatically
         gpc.set_device(local_rank)
-
-    # set the number of processes running on the same node
-    gpc.detect_num_processes_on_current_node()
 
     gpc.set_seed(seed)
 
@@ -577,6 +606,7 @@ def initialize_distributed_env(
     master_port: int = 8888,
     seed: int = 1024,
     args_check=True,
+    backend: str = "nccl",
 ):
     """
     Initialize distributed environment for distributed training.
@@ -587,14 +617,13 @@ def initialize_distributed_env(
         master_port (str): The master port for distributed training. 8888 by default.
         seed (int, optional): Specified random seed for every process. 1024 by default.
     """
+    backend = internlm_accelerator._communication_backend_name
 
     # close automatic garbage collection
     gc.disable()
 
-    torch.cuda.empty_cache()
-
     if launcher == "torch":
-        launch_from_torch(config=config, seed=seed)
+        launch_from_torch(config=config, seed=seed, backend=backend)
     elif launcher == "slurm":
         launch_from_slurm(
             config=config,
@@ -607,16 +636,6 @@ def initialize_distributed_env(
 
     if args_check:
         args_sanity_check()
-
-    # init light monitor client
-    if gpc.config.get("monitor") and gpc.config.monitor.get("alert"):
-        alert_config = gpc.config.monitor.alert
-        if alert_config.enable_feishu_alert:
-            light_monitor_address = alert_config.light_monitor_address
-            if light_monitor_address:
-                initialize_light_monitor(light_monitor_address)
-            elif gpc.is_rank_for_log():
-                logger.warning("monitor address is none, monitor could not be used!")
 
 
 def get_config_value(config, key, defalut):
@@ -653,7 +672,7 @@ def try_bind_numa(global_rank, world_size, local_rank=None):
             return
 
         if local_rank is None:
-            devices_per_node = torch.cuda.device_count()
+            devices_per_node = internlm_accelerator.device_count()
             local_rank = global_rank % devices_per_node
 
         # compute numa id for each locak rank

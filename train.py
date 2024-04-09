@@ -6,7 +6,6 @@ import time
 import traceback
 from functools import partial
 
-import torch
 import torch.distributed as dist
 
 import internlm
@@ -36,12 +35,13 @@ from internlm.train import (
 from internlm.utils.common import (
     BatchSkipper,
     enable_pytorch_expandable_segments,
+    get_current_device,
     get_megatron_flops,
     launch_time,
     parse_args,
 )
 from internlm.utils.gputest import empty_cache_and_diag
-from internlm.utils.logger import get_logger, initialize_uniscale_logger
+from internlm.utils.logger import get_logger
 from internlm.utils.megatron_timers import megatron_timer as timer
 from internlm.utils.parallel import get_parallel_log_file_name
 from internlm.utils.simple_memory_profiler import SimpleMemoryProfiler
@@ -49,26 +49,6 @@ from internlm.utils.writer import Writer
 
 # global llm logger
 logger = get_logger(__file__)
-
-
-def initialize_llm_logger(start_time: str):
-    """
-    Initialize customed uniscale logger.
-
-    Args:
-        start_time (str): The launch time of current training job.
-
-    Returns: The instance of uniscale logger.
-    """
-
-    uniscale_logger = initialize_uniscale_logger(
-        job_name=gpc.config.JOB_NAME, launch_time=start_time, file_name=get_parallel_log_file_name()
-    )
-    if uniscale_logger is not None:
-        global logger
-        logger = uniscale_logger
-
-    return uniscale_logger
 
 
 def main(args):
@@ -96,10 +76,7 @@ def main(args):
     current_time = launch_time()
     objs = [current_time]
     dist.broadcast_object_list(objs, src=0)
-    current_time = objs[0]
-
-    # initialize customed llm logger
-    uniscale_logger = initialize_llm_logger(start_time=current_time)
+    current_time = objs[0].replace(":", ".")
 
     # initialize model
     model = initialize_model()
@@ -153,7 +130,7 @@ def main(args):
 
     # initialize metric for calculating accuracy and perplexity
     metric = AccPerplex(
-        device=torch.cuda.current_device(),
+        device=get_current_device(),
         tp_pg=gpc.get_group(ParallelMode.TENSOR),
         dp_pg=gpc.get_group(ParallelMode.DATA),
         dataset_types=dataset_types,
@@ -195,7 +172,7 @@ def main(args):
         # start iterating the train data and begin training
         for batch_count in range(train_state.batch_count, total_steps):
             empty_cache_and_diag(batch_count, interval=gpc.config.data.empty_cache_and_diag_interval)
-            # torch.cuda.memory._record_memory_history()
+            # internlm_accelerator.memory._record_memory_history()
             start_time = time.time()
             timer("one-batch").start()
 
@@ -216,6 +193,8 @@ def main(args):
             # process data
             if batch[0].get("type_ids", None) is not None:
                 metric.set_current_type_ids(type_ids=batch[0].pop("type_ids", None))
+            # if batch[0].get("cu_seqlens", None) is not None:
+            #     metric.set_cu_seqlens(cu_seqlens=batch[0].pop("cu_seqlens", None))
 
             # do forward and backward
             timer("fwd-bwd").start()
@@ -273,7 +252,7 @@ def main(args):
                 moe_loss=moe_loss,
                 grad_norm=grad_norm_groups,
                 metric=metric,
-                update_panel=uniscale_logger is not None,
+                update_panel=False,
             )
 
             timer("one-batch").stop()
@@ -286,7 +265,7 @@ def main(args):
                     writer=writer,
                     logger=logger,
                     step_count=train_state.step_count,
-                    update_panel=uniscale_logger is not None,
+                    update_panel=False,
                 )
 
             # checkpoint the training states in specific steps, which is determined by the args "checkpoint_every"
@@ -301,8 +280,7 @@ def main(args):
             if batch_count % 2 == 0:
                 prof.step()
 
-            # torch.cuda.memory._dump_snapshot(f"my_snapshot_{gpc.get_global_rank()}.pickle")
-            torch.cuda.reset_peak_memory_stats()
+            # internlm_accelerator.memory._dump_snapshot(f"my_snapshot_{gpc.get_global_rank()}.pickle")
 
     ckpt_manager.wait_async_upload_finish()
 
@@ -329,4 +307,4 @@ if __name__ == "__main__":
                 alert_address=gpc.config.monitor.alert.feishu_alert_address, excp_info=traceback.format_exc()
             )
 
-            # torch.cuda.memory._dump_snapshot(f"my_snapshot_{gpc.get_global_rank()}.pickle")
+            # internlm_accelerator.memory._dump_snapshot(f"my_snapshot_{gpc.get_global_rank()}.pickle")

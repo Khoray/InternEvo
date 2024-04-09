@@ -17,11 +17,11 @@ project_root = os.path.abspath(os.path.join(script_dir, "../../"))
 sys.path.append(project_root)
 
 import internlm  # noqa: E402
-from internlm.checkpoint import CheckpointManager
+from internlm.checkpoint import CheckpointManager  # noqa: E402
 from internlm.core.context import ParallelMode  # noqa: E402
 from internlm.core.context import global_context as gpc  # noqa: E402
 from internlm.core.trainer import TrainState  # noqa: E402
-from internlm.data import (
+from internlm.data import (  # noqa: E402
     build_train_loader_with_data_type,
     build_valid_loader_with_data_type,
 )
@@ -42,12 +42,13 @@ from internlm.train import (  # noqa: E402
 )
 from internlm.utils.common import (  # noqa: E402
     BatchSkipper,
+    get_current_device,
     get_megatron_flops,
     launch_time,
     parse_args,
 )
 from internlm.utils.gputest import empty_cache_and_diag  # noqa: E402
-from internlm.utils.logger import get_logger, initialize_uniscale_logger  # noqa: E402
+from internlm.utils.logger import get_logger  # noqa: E402
 from internlm.utils.megatron_timers import megatron_timer as timer  # noqa: E402
 from internlm.utils.parallel import get_parallel_log_file_name  # noqa: E402
 from internlm.utils.simple_memory_profiler import SimpleMemoryProfiler  # noqa: E402
@@ -57,29 +58,13 @@ from internlm.utils.writer import Writer  # noqa: E402
 logger = get_logger(__file__)
 
 
-def initialize_llm_logger(start_time: str):
-    """
-    Initialize customed uniscale logger.
-
-    Args:
-        start_time (str): The launch time of current training job.
-
-    Returns: The instance of uniscale logger.
-    """
-
-    uniscale_logger = initialize_uniscale_logger(
-        job_name=gpc.config.JOB_NAME, launch_time=start_time, file_name=get_parallel_log_file_name()
-    )
-    if uniscale_logger is not None:
-        global logger
-        logger = uniscale_logger
-
-    return uniscale_logger
-
-
 def check_model_weights(model, ckpt_path, total_equal=False):
     model1_dict = torch.load(ckpt_path, map_location="cuda")
     model2_dict = model.state_dict()
+
+    for key in model2_dict.keys():
+        if key not in model1_dict:
+            assert False, f"Error: The key {key} for current model dose not exist in standard ckpt!"
 
     for key in model1_dict.keys():
         if key in model2_dict:
@@ -121,9 +106,6 @@ def main(args):
     objs = [current_time]
     dist.broadcast_object_list(objs, src=0)
     current_time = objs[0]
-
-    # initialize customed llm logger
-    uniscale_logger = initialize_llm_logger(start_time=current_time)
 
     # initialize model
     model = initialize_model()
@@ -172,7 +154,7 @@ def main(args):
 
     # initialize metric for calculating accuracy and perplexity
     metric = AccPerplex(
-        device=torch.cuda.current_device(),
+        device=get_current_device(),
         tp_pg=gpc.get_group(ParallelMode.TENSOR),
         dp_pg=gpc.get_group(ParallelMode.DATA),
         dataset_types=dataset_types,
@@ -224,9 +206,11 @@ def main(args):
     # check model init weights
     if hasattr(gpc.config, "CHECK_INIT") and gpc.config.CHECK_INIT == 1:
         ckpt_name = (
-            f"model_tp{gpc.get_local_rank(ParallelMode.TENSOR)}_pp{gpc.get_local_rank(ParallelMode.PIPELINE)}.pt"
+            f"model_dp{gpc.get_local_rank(ParallelMode.DATA)}"
+            f"_tp{gpc.get_local_rank(ParallelMode.TENSOR)}"
+            f"_pp{gpc.get_local_rank(ParallelMode.PIPELINE)}.pt"
         )
-        ckpt_path = os.path.join(os.environ["share_path"], "quailty_assurance/7B_init_8_tp=4_pp=2_ckpt", ckpt_name)
+        ckpt_path = os.path.join(os.environ["share_path"], "quailty_assurance/7B_init_dp=2_tp=2_pp=2_ckpt", ckpt_name)
         check_model_weights(model, ckpt_path, total_equal=True)
 
     with initialize_llm_profile(profiling=args.profiling, start_time=current_time) as prof:
@@ -319,7 +303,7 @@ def main(args):
                 moe_loss=moe_loss,
                 grad_norm=grad_norm_groups,
                 metric=metric,
-                update_panel=uniscale_logger is not None,
+                update_panel=False,
             )
 
             timer("one-batch").stop()
@@ -332,11 +316,11 @@ def main(args):
                     writer=writer,
                     logger=logger,
                     step_count=train_state.step_count,
-                    update_panel=uniscale_logger is not None,
+                    update_panel=False,
                 )
 
             # check model weights
-            if batch_count > 0 and batch_count % 100 == 0:
+            if gpc.is_rank_for_log() and batch_count > 0 and batch_count % 100 == 0:
                 ckpt_path = os.path.join(
                     os.environ["share_path"],
                     "quailty_assurance/7B_model_weights_ckpt",
@@ -374,6 +358,9 @@ if __name__ == "__main__":
     ):
         try:
             main(args)
+        except AssertionError as e:
+            logger.error(e)
+            sys.exit(1)
         except Exception:
             logger.error(
                 f"Raise exception from {hostname} with rank id: {gpc.get_global_rank()}\n{traceback.format_exc()}",
@@ -381,3 +368,4 @@ if __name__ == "__main__":
             mm.monitor_exception(
                 alert_address=gpc.config.monitor.alert.feishu_alert_address, excp_info=traceback.format_exc()
             )
+            sys.exit(1)
