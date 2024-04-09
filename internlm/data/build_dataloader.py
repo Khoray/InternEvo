@@ -36,7 +36,9 @@ def get_tokenized_train_loader_items(data_cfg):
                 train_ds, max_length_per_sample=data_cfg.seq_len, packed_length=data_cfg.packed_length
             )
         else:
-            train_ds = RandomDataset(num_samples=1000000, max_len=data_cfg.seq_len)
+            train_ds = RandomDataset(
+                num_samples=1000000, max_len=data_cfg.seq_len, fixed_seqlen=data_cfg.fixed_random_dataset_seqlen
+            )
 
             if data_cfg.pack_sample_into_one:
                 train_ds = PackedDatasetWithoutCuSeqlen(
@@ -80,7 +82,11 @@ def get_tokenized_valid_loader_items(data_cfg):
                 num_samples=gpc.get_world_size(ParallelMode.DATA) * 500, max_len=data_cfg.seq_len
             )
         else:
-            valid_ds = RandomDataset(num_samples=gpc.get_world_size(ParallelMode.DATA) * 500, max_len=data_cfg.seq_len)
+            valid_ds = RandomDataset(
+                num_samples=gpc.get_world_size(ParallelMode.DATA) * 500,
+                max_len=data_cfg.seq_len,
+                fixed_seqlen=data_cfg.fixed_random_dataset_seqlen,
+            )
     else:
         valid_ds = get_dataset_dict(folder=data_cfg.valid_folder, split="")
 
