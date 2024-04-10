@@ -68,6 +68,8 @@ data = dict(
     valid_folder=VALID_FOLDER,
     empty_cache_and_diag_interval=200,
     diag_outlier_ratio=1.1,
+    image_size=336,
+    patch_size=14,
 )
 
 grad_scaler = dict(

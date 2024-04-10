@@ -31,7 +31,13 @@ def get_tokenized_train_loader_items(data_cfg):
     """Get the training data loader for tokenized dataset."""
     if data_cfg.get("train_folder", None) is None:
         if data_cfg.get("is_multimodal", False):
-            train_ds = RandomDatasetMultimodal(num_samples=10000, max_len=data_cfg.seq_len)
+            image_token_size = int(data_cfg.image_size // data_cfg.patch_size) ** 2
+            train_ds = RandomDatasetMultimodal(
+                num_samples=10000,
+                max_len=data_cfg.seq_len,
+                image_size=data_cfg.image_size,
+                image_token_size=image_token_size,
+            )
             train_ds = PackedDatasetWithPadForMultimodal(
                 train_ds, max_length_per_sample=data_cfg.seq_len, packed_length=data_cfg.packed_length
             )
@@ -78,8 +84,12 @@ def get_tokenized_valid_loader_items(data_cfg):
     """Get the validation data loader for tokenized dataset."""
     if not data_cfg.valid_folder:
         if data_cfg.get("is_multimodal", False):
+            image_token_size = int(data_cfg.image_size // data_cfg.patch_size) ** 2
             valid_ds = RandomDatasetMultimodal(
-                num_samples=gpc.get_world_size(ParallelMode.DATA) * 500, max_len=data_cfg.seq_len
+                num_samples=gpc.get_world_size(ParallelMode.DATA) * 500,
+                max_len=data_cfg.seq_len,
+                image_size=data_cfg.image_size,
+                image_token_size=image_token_size,
             )
         else:
             valid_ds = RandomDataset(
