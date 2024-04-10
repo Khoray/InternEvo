@@ -9,11 +9,11 @@ from internlm.core.naive_amp import set_output_attr_to_module
 from internlm.initialize.initialize_tensor import normal_, uniform_
 from internlm.model.modeling_llama import PackedFlashLlamaLayer1D
 from internlm.model.modules.embedding import Embedding1D
+from internlm.model.ops.fusion_ops_import_helper import try_import_RMSNorm
 from internlm.model.ops.linear import RewardModelLinear, ScaleColumnParallelLinear
 from internlm.model.utils import (
     gather_forward_split_backward,
     split_forward_gather_backward,
-    try_import_RMSNorm,
 )
 from internlm.solver.pipeline_utils import partition_uniform
 from internlm.utils.common import filter_kwargs
@@ -107,6 +107,8 @@ class PackedFlashLlava1D(nn.Module):
         out_head_init_std: float = 0.02,
         init_type: str = "normal",
         rope_base: int = 10000,
+        mlp_layer_fusion: bool = False,
+        multiple_of: int = 256,
         image_token_id: int = 200000,
         vit_cfg=None,
         vision_proj_cfg=None,
@@ -186,6 +188,8 @@ class PackedFlashLlava1D(nn.Module):
                     init_type=init_type,
                     rope_base=rope_base,
                     tp_mode=self.tp_mode,
+                    mlp_layer_fusion=mlp_layer_fusion,
+                    multiple_of=multiple_of,
                 )
                 for lid in range(num_layers)
             ]
@@ -400,6 +404,8 @@ def build_model_with_cfg(
     out_head_init_std: float = 0.02,
     init_type: str = "normal",
     rope_base: int = 10000,
+    mlp_layer_fusion: bool = False,
+    multiple_of: int = 256,
     image_token_id: int = 200000,
     vit_cfg=None,
     vision_proj_cfg=None,
@@ -478,6 +484,8 @@ def build_model_with_cfg(
         out_head_init_std=out_head_init_std,
         init_type=init_type,
         rope_base=rope_base,
+        mlp_layer_fusion=mlp_layer_fusion,
+        multiple_of=multiple_of,
         image_token_id=image_token_id,
         vit_cfg=vit_cfg,
         vision_proj_cfg=vision_proj_cfg,
