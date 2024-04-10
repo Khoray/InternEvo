@@ -121,7 +121,6 @@ class PackedFlashLlava1D(nn.Module):
         if not checkpoint:
             checkpoint_fraction = 0
         checkpoint_layer_num = num_layers * checkpoint_fraction
-        sequence_parallel = gpc.config.parallel.get("sequence_parallel", False)
         self.tp_mode = "mtp"
         self.dtype = dtype
         self.image_token_id = image_token_id
@@ -135,21 +134,10 @@ class PackedFlashLlava1D(nn.Module):
             head_cls = ScaleColumnParallelLinear
 
         if first:
-            if embed_split_hidden or not gpc.config.model.use_flash_attn:
-                self.tok_embeddings = Embedding1D(num_embeddings=vocab_size, embedding_dim=hidden_size)
-            else:
-                from flash_attn.modules.embedding import ParallelGPT2Embeddings
+            self.tok_embeddings = Embedding1D(
+                num_embeddings=vocab_size, embedding_dim=hidden_size, embed_split_hidden=embed_split_hidden
+            )
 
-                self.tok_embeddings = ParallelGPT2Embeddings(
-                    embed_dim=hidden_size,
-                    vocab_size=vocab_size,
-                    max_position_embeddings=-1,
-                    process_group=gpc.get_group(ParallelMode.TENSOR),
-                    padding_idx=None,
-                    sequence_parallel=sequence_parallel,
-                    device=device,
-                    dtype=dtype,
-                )
             for _, param in self.tok_embeddings.named_parameters():
                 if init_type == "normal":
                     normal_(std=embedding_init_std)(param)
@@ -287,8 +275,6 @@ class PackedFlashLlava1D(nn.Module):
 
         if cu_seqlens is not None:
             cu_seqlens = cu_seqlens.squeeze(0)
-            hidden_states = hidden_states.squeeze(0)  # If cu_seqlens is passed in，it indicated a packed state，
-            # the batch dimension with a size of 1 should be directly squeezed off.
 
         if indexes is not None:
             assert len(indexes) == 1
@@ -314,11 +300,7 @@ class PackedFlashLlava1D(nn.Module):
             hidden_states = self.norm(hidden_states.float())
 
         if hasattr(self, "output"):
-            # Evaluation
-            if gpc.is_evaluating is True:
-                hidden_states = self.output(hidden_states, gather_dim=1, tp_mode=self.tp_mode)
-            else:  # Training
-                hidden_states = self.output(hidden_states, gather_dim=0, tp_mode=self.tp_mode)
+            hidden_states = self.output(hidden_states, gather_dim=1, tp_mode=self.tp_mode)
 
         if not self.parallel_output:
             hidden_states = gather_forward_split_backward(hidden_states, ParallelMode.TENSOR, dim=-1)
